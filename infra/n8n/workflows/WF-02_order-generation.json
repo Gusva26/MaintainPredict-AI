@@ -1,0 +1,653 @@
+{
+  "id": "Eiri8durFib1FUVX",
+  "name": "WF-02 Order Generation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "generate-order",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "wh-02",
+      "name": "Webhook: POST /generate-order",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        200,
+        300
+      ],
+      "webhookId": "wf02-order-generation"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.prediction_id, p.equipment_id, p.component, p.failure_probability, p.window_days, e.name AS equipment_name, e.criticality, e.downtime_cost_eur_h FROM predictions p JOIN equipment e ON e.equipment_id = p.equipment_id WHERE p.prediction_id = $1",
+        "options": {
+          "queryReplacement": "={{ $json.body.prediction_id }}"
+        }
+      },
+      "id": "pg-02a",
+      "name": "Postgres: recuperar predicción",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        420,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "mp_postgres",
+          "name": "MaintainPredict Postgres"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !!$json.prediction_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-02-exists",
+      "name": "IF: predicción existe",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.APP_BASE_URL}}/api/orders/auto-plan",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "content-type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-internal-token",
+              "value": "={{$env.INTERNAL_TOKEN}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ prediction_id: $('Postgres: recuperar predicción').item.json.prediction_id }) }}",
+        "options": {
+          "timeout": 90000
+        }
+      },
+      "id": "http-02-plan",
+      "name": "HTTP: POST /api/orders/auto-plan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        860,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.data.requires_hitl }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-02-hitl",
+      "name": "IF: requires_hitl",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Construye la URL de resume del Wait (firmada con el execution ID)\nconst executionId = $execution.id;\nconst internalBase = $env.N8N_WEBHOOK_BASE_URL ?? 'http://n8n:5678';\n// $execution.resumeUrl apunta al WEBHOOK_URL configurado en n8n (localhost);\n// reescribimos el host a la URL interna para que el contenedor web pueda reanudar la espera.\nconst resumeUrl = ($execution.resumeUrl ?? `${internalBase}/webhook-waiting/${executionId}`).replace(/^https?:\\/\\/[^/]+/, internalBase);\n// Enlaces para el humano: la URL pública (navegador), no la interna del contenedor.\n// Ambos llevan la decisión prevista, para que la ficha de la orden sepa qué mostrar.\nconst publicBase = $env.PUBLIC_APP_URL || $env.APP_BASE_URL;\nconst hitlLink = (decision) =>\n  `${publicBase}/orders/${$json.data.order_id}?resume=${encodeURIComponent(resumeUrl)}&decision=${decision}`;\n\nreturn [{\n  json: {\n    ...$json.data,\n    execution_id: executionId,\n    resume_url: resumeUrl,\n    approve_url: hitlLink('approve'),\n    reject_url: hitlLink('reject'),\n  },\n}];"
+      },
+      "id": "code-02a",
+      "name": "Construir URLs HITL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.SUPERVISOR_EMAIL}}",
+        "subject": "=⚠️ HITL requerido: orden #{{$json.order_id}} · parada {{$json.estimated_downtime_h}}h",
+        "emailFormat": "html",
+        "html": "=<div style=\"font-family:system-ui,sans-serif;max-width:600px\">\n<h2 style=\"color:#2563eb\">Aprobación humana requerida</h2>\n<p>Se ha planificado la orden <b>#{{$json.order_id}}</b> con parada estimada <b>{{$json.estimated_downtime_h}}h</b> (regla 23.3: > 4h requiere HITL).</p>\n<table style=\"border-collapse:collapse;width:100%;margin:16px 0\">\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\"><b>Fecha programada</b></td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{$json.scheduled_date}}</td></tr>\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\"><b>Técnico propuesto</b></td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{$json.technician}}</td></tr>\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\"><b>Prioridad</b></td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{$json.priority}}</td></tr>\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\"><b>Repuestos</b></td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{ JSON.stringify($json.parts) }}</td></tr>\n</table>\n<p><b>Razonamiento del PlannerAgent:</b></p>\n<blockquote style=\"border-left:3px solid #2563eb;padding-left:12px;color:#475569\">{{$json.reasoning}}</blockquote>\n<p style=\"text-align:center;margin:24px 0\">\n  <a href=\"{{$json.approve_url}}\" style=\"background:#2563eb;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:600;display:inline-block;margin:4px\">Aprobar</a>\n  <a href=\"{{$json.reject_url}}\" style=\"background:#dc2626;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:600;display:inline-block;margin:4px\">Rechazar</a>\n</p>\n<p style=\"color:#64748b;font-size:12px\">Los dos botones abren la ficha de la orden en la aplicación: la decisión se confirma allí, con tu sesión, así que desde el correo no se aprueba ni se rechaza nada. Aprobar autoriza la parada y avisa al técnico; rechazar deja la orden cancelada. Si nadie decide en 30 minutos, el workflow expira y la orden queda pendiente de revisión manual.</p>\n</div>",
+        "options": {}
+      },
+      "id": "email-02-approve",
+      "name": "Email: solicitar aprobación HITL",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1520,
+        220
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "mp_smtp",
+          "name": "MaintainPredict SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "httpMethod": "POST",
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 30,
+        "resumeUnit": "minutes",
+        "options": {}
+      },
+      "id": "wait-02",
+      "name": "Wait: HITL (resume-on-webhook · 30 min)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1740,
+        220
+      ],
+      "webhookId": "wf02-hitl-wait",
+      "notes": "Se resuelve al decidir en /orders/:id (aprobar o rechazar). Timeout de 30 min como seguridad."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Distingue las tres salidas de la espera: aprobar, rechazar y expirar.\n// Si la espera se reanuda por timeout, el item que entra no trae 'decision'.\nconst data = $input.first().json;\nconst body = data?.body ?? data ?? {};\nconst decision =\n  body.decision === 'approve' || body.decision === 'reject'\n    ? body.decision\n    // Compatibilidad con llamadas antiguas que solo enviaban { approved: true }.\n    : body.approved === true\n      ? 'approve'\n      : 'timeout';\n\nreturn [{\n  json: {\n    decision,\n    approved: decision === 'approve',\n    rejected: decision === 'reject',\n    expired: decision === 'timeout',\n    order_id: $('HTTP: POST /api/orders/auto-plan').item.json.data.order_id,\n  },\n}];"
+      },
+      "id": "code-02b",
+      "name": "Evaluar respuesta HITL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.approved }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-02-approved",
+      "name": "IF: aprobada",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2180,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$('HTTP: POST /api/orders/auto-plan').item.json.data.technician_email || $env.SUPERVISOR_EMAIL}}",
+        "subject": "=Nueva orden #{{$('HTTP: POST /api/orders/auto-plan').item.json.data.order_id}} asignada",
+        "emailFormat": "html",
+        "html": "=<h2>Orden de mantenimiento asignada</h2>\n<p>Orden <b>#{{$('HTTP: POST /api/orders/auto-plan').item.json.data.order_id}}</b></p>\n<ul>\n  <li>Fecha programada: {{$('HTTP: POST /api/orders/auto-plan').item.json.data.scheduled_date}}</li>\n  <li>Repuestos: {{JSON.stringify($('HTTP: POST /api/orders/auto-plan').item.json.data.parts)}}</li>\n  <li>Prioridad: {{$('HTTP: POST /api/orders/auto-plan').item.json.data.priority}}</li>\n</ul>\n<p><a href=\"{{ $env.PUBLIC_APP_URL || $env.APP_BASE_URL }}/technician\" style=\"background:#16a34a;color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px\">Abrir App Técnico</a></p>",
+        "options": {}
+      },
+      "id": "email-02-tech",
+      "name": "Email: notificar técnico (aprobada)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2400,
+        140
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "mp_smtp",
+          "name": "MaintainPredict SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.SUPERVISOR_EMAIL}}",
+        "subject": "=⏱️ HITL expirado: orden #{{$('HTTP: POST /api/orders/auto-plan').item.json.data.order_id}}",
+        "emailFormat": "html",
+        "html": "=<h2>Timeout de aprobación</h2>\n<p>La orden <b>#{{$('HTTP: POST /api/orders/auto-plan').item.json.data.order_id}}</b> no fue aprobada en 30 minutos.</p>\n<p><a href=\"{{ $env.PUBLIC_APP_URL || $env.APP_BASE_URL }}/orders/{{$('HTTP: POST /api/orders/auto-plan').item.json.data.order_id}}\">Revisar manualmente</a></p>",
+        "options": {}
+      },
+      "id": "email-02-timeout",
+      "name": "Email: HITL expirado",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2400,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "mp_smtp",
+          "name": "MaintainPredict SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$('HTTP: POST /api/orders/auto-plan').item.json.data.technician_email || $env.SUPERVISOR_EMAIL}}",
+        "subject": "=Nueva orden #{{$json.data.order_id}} asignada",
+        "emailFormat": "html",
+        "html": "=<h2>Orden de mantenimiento asignada</h2>\n<p>Orden <b>#{{$json.data.order_id}}</b> — parada estimada {{$json.data.estimated_downtime_h}}h.</p>\n<ul>\n  <li>Técnico: {{$json.data.technician}}</li>\n  <li>Fecha: {{$json.data.scheduled_date}}</li>\n  <li>Prioridad: {{$json.data.priority}}</li>\n</ul>\n<p><a href=\"{{ $env.PUBLIC_APP_URL || $env.APP_BASE_URL }}/technician\">Abrir App Técnico</a></p>",
+        "options": {}
+      },
+      "id": "email-02-auto",
+      "name": "Email: notificar técnico (auto)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1300,
+        400
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "mp_smtp",
+          "name": "MaintainPredict SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, order: $('HTTP: POST /api/orders/auto-plan').item.json.data }) }}"
+      },
+      "id": "resp-02",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2620,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, error: 'Predicción no encontrada' }) }}",
+        "options": {
+          "responseCode": 404
+        }
+      },
+      "id": "resp-02-404",
+      "name": "Respond 404",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        860,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.SUPERVISOR_EMAIL}}",
+        "subject": "=❌ Error en WF-02 (order generation)",
+        "emailFormat": "html",
+        "html": "=<h2>Error en generación de órdenes</h2>\n<p>Execution: {{$execution.id}}</p>\n<p>Error: {{$json.error?.message}}</p>",
+        "options": {}
+      },
+      "id": "email-02-error",
+      "name": "Email: alerta error WF-02",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        420,
+        620
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "mp_smtp",
+          "name": "MaintainPredict SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "err-trigger-02",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "reject",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-02-rejected",
+      "name": "IF: rechazada",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2180,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.SUPERVISOR_EMAIL}}",
+        "subject": "=❌ HITL rechazado: orden #{{$json.order_id}} cancelada",
+        "emailFormat": "html",
+        "html": "=<h2>Orden rechazada</h2>\n<p>La orden <b>#{{$json.order_id}}</b> ha quedado <b>cancelada</b>: no se ejecutará y <b>no se ha avisado al técnico</b>.</p>\n<p>Quien la rechazó, cuándo y por qué están en las notas de la orden y en la bitácora de auditoría (<code>reject_order</code>).</p>\n<p>Si el rechazo fue por falta de repuestos o de ventana de parada, corrige ese dato en la predicción de origen antes de volver a planificar.</p>\n<p><a href=\"{{ $env.PUBLIC_APP_URL || $env.APP_BASE_URL }}/orders/{{$json.order_id}}\">Ver la orden</a></p>",
+        "options": {}
+      },
+      "id": "email-02-reject",
+      "name": "Email: HITL rechazado",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2400,
+        460
+      ],
+      "credentials": {
+        "smtp": {
+          "id": "mp_smtp",
+          "name": "MaintainPredict SMTP"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: POST /generate-order": {
+      "main": [
+        [
+          {
+            "node": "Postgres: recuperar predicción",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres: recuperar predicción": {
+      "main": [
+        [
+          {
+            "node": "IF: predicción existe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: predicción existe": {
+      "main": [
+        [
+          {
+            "node": "HTTP: POST /api/orders/auto-plan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 404",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP: POST /api/orders/auto-plan": {
+      "main": [
+        [
+          {
+            "node": "IF: requires_hitl",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: requires_hitl": {
+      "main": [
+        [
+          {
+            "node": "Construir URLs HITL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: notificar técnico (auto)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Construir URLs HITL": {
+      "main": [
+        [
+          {
+            "node": "Email: solicitar aprobación HITL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: solicitar aprobación HITL": {
+      "main": [
+        [
+          {
+            "node": "Wait: HITL (resume-on-webhook · 30 min)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait: HITL (resume-on-webhook · 30 min)": {
+      "main": [
+        [
+          {
+            "node": "Evaluar respuesta HITL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluar respuesta HITL": {
+      "main": [
+        [
+          {
+            "node": "IF: aprobada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: aprobada": {
+      "main": [
+        [
+          {
+            "node": "Email: notificar técnico (aprobada)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IF: rechazada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: notificar técnico (aprobada)": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: HITL expirado": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: notificar técnico (auto)": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Email: alerta error WF-02",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: rechazada": {
+      "main": [
+        [
+          {
+            "node": "Email: HITL rechazado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Email: HITL expirado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: HITL rechazado": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveExecutionProgress": true
+  },
+  "tags": [
+    {
+      "name": "wf-02"
+    }
+  ],
+  "versionId": "2",
+  "active": false
+}

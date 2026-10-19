@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push: { branches: [main, develop] }
+  pull_request: { branches: [main, develop] }
+
+jobs:
+  web:
+    name: Web (Next.js)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: maintainpredict_test
+          POSTGRES_USER: mp_test
+          POSTGRES_PASSWORD: mp_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mp_test"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgresql://mp_test:mp_test@localhost:5432/maintainpredict_test
+      JWT_SECRET: test_secret_at_least_32_characters_long_x
+      JWT_REFRESH_SECRET: test_refresh_at_least_32_characters_long
+      SENSOR_API_KEY: sensor_key_change_me
+      INTERNAL_TOKEN: internal_token_change_me_at_least_32_chars
+      ML_SERVICE_URL: http://localhost:8000
+      ML_SERVICE_API_KEY: ml_internal_key_change_me
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Aplicar esquema
+        run: |
+          PGPASSWORD=mp_test psql -h localhost -U mp_test -d maintainpredict_test \
+            -f infra/postgres/init/00_extensions.sql || true
+          PGPASSWORD=mp_test psql -h localhost -U mp_test -d maintainpredict_test \
+            -f infra/postgres/init/01_schema.sql
+      - name: Aplicar objetos de las fases A y B (vistas, funciones, procedimientos y seeds)
+        run: |
+          # El seed de lecturas por defecto ronda las 600 k filas; en CI basta una muestra
+          # pequeña, así que se le baja el volumen por variables (los demás ficheros las ignoran).
+          for f in 03_views 04_functions 05_procedures 06_seed_core 08_seed_predictions 09_seed_kb 10_seed_observability 11_seed_audit; do
+            PGPASSWORD=mp_test psql -h localhost -U mp_test -d maintainpredict_test \
+              -v ON_ERROR_STOP=1 -f "infra/postgres/init/${f}.sql"
+          done
+          PGPASSWORD=mp_test psql -h localhost -U mp_test -d maintainpredict_test \
+            -v ON_ERROR_STOP=1 -v mp_days=3 -v mp_step_minutes=360 \
+            -f infra/postgres/init/07_seed_readings.sql
+      - run: pnpm --filter web lint
+      - run: pnpm --filter web test -- --run
+      - run: pnpm --filter web build
+
+  ml:
+    name: ML Service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r apps/ml-service/requirements.txt
+      - run: pytest apps/ml-service/tests -q
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [web, ml]
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile.prod
+          push: false
+          tags: maintainpredict-web:ci
+      - name: Build ml image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/ml-service
+          file: apps/ml-service/Dockerfile
+          push: false
+          tags: maintainpredict-ml:ci

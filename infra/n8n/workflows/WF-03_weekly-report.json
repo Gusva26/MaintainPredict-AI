@@ -1,0 +1,266 @@
+{
+  "id": "2kDq2Dn152FFO7pe",
+  "name": "WF-03 Weekly Report",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 8 * * 1" }]
+        }
+      },
+      "id": "cron-03",
+      "name": "Schedule: lunes 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {},
+      "id": "manual-03",
+      "name": "Manual Trigger: bajo demanda",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [200, 480]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calcula la ventana de la semana anterior (lunes 00:00 a domingo 23:59)\nconst now = new Date();\nconst dayOfWeek = now.getDay() === 0 ? 7 : now.getDay();\nconst lastMonday = new Date(now);\nlastMonday.setDate(now.getDate() - dayOfWeek - 6);\nlastMonday.setHours(0, 0, 0, 0);\nconst lastSunday = new Date(lastMonday);\nlastSunday.setDate(lastMonday.getDate() + 6);\nlastSunday.setHours(23, 59, 59, 999);\nreturn [{ json: {\n  start: lastMonday.toISOString(),\n  end: lastSunday.toISOString(),\n  label: `${lastMonday.toISOString().slice(0,10)}_${lastSunday.toISOString().slice(0,10)}`,\n} }];"
+      },
+      "id": "code-03-window",
+      "name": "Calcular ventana semanal",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.APP_BASE_URL}}/api/reports/weekly?start={{ $json.start }}&end={{ $json.end }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-internal-token", "value": "={{$env.INTERNAL_TOKEN}}" }
+          ]
+        },
+        "options": { "timeout": 60000 }
+      },
+      "id": "http-03-json",
+      "name": "HTTP: reporte JSON",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 220],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.APP_BASE_URL}}/api/reports/weekly?start={{ $('Calcular ventana semanal').item.json.start }}&end={{ $('Calcular ventana semanal').item.json.end }}&format=pdf",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-internal-token", "value": "={{$env.INTERNAL_TOKEN}}" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "file" } },
+          "timeout": 60000
+        }
+      },
+      "id": "http-03-pdf",
+      "name": "HTTP: reporte PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 380],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.APP_BASE_URL}}/api/reports/weekly?start={{ $('Calcular ventana semanal').item.json.start }}&end={{ $('Calcular ventana semanal').item.json.end }}&format=xlsx",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-internal-token", "value": "={{$env.INTERNAL_TOKEN}}" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "responseFormat": "file" } },
+          "timeout": 60000
+        }
+      },
+      "id": "http-03-xlsx",
+      "name": "HTTP: reporte XLSX",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 540],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/data/reports/weekly_{{ $('Calcular ventana semanal').item.json.label }}.pdf",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "id": "fs-03-pdf",
+      "name": "FS: guardar PDF",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [860, 380],
+      "notes": "Persistencia local; /data/reports está montado como volumen"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/data/reports/weekly_{{ $('Calcular ventana semanal').item.json.label }}.xlsx",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "id": "fs-03-xlsx",
+      "name": "FS: guardar XLSX",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [860, 540]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.OPENAI_BASE_URL}}/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "HTTP-Referer", "value": "={{$env.PUBLIC_APP_URL}}" },
+            { "name": "X-Title", "value": "MaintainPredict AI" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $env.OPENAI_CHAT_MODEL, messages: [{ role: 'system', content: 'Eres un analista industrial. Genera un resumen ejecutivo (máx 180 palabras) del reporte semanal. Destaca: órdenes por estado, top 5 equipos en riesgo, precisión del modelo, cumplimiento de KPIs (paradas -60%, costos -30%, precisión 85%) y falsos positivos. Usa un tono profesional, en español, sin markdown.' }, { role: 'user', content: 'Datos del reporte: ' + JSON.stringify($('HTTP: reporte JSON').item.json.data) }], temperature: 0.3, max_tokens: 1500 }) }}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "llm-03",
+      "name": "LLM: resumen ejecutivo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 220],
+      "credentials": { "openAiApi": { "id": "mp_openai", "name": "MaintainPredict OpenAI" } },
+      "onError": "continueRegularOutput",
+      "notes": "LLM vía proveedor compatible con OpenAI (URL en OPENAI_BASE_URL, p. ej. Groq https://api.groq.com/openai/v1). Si falla (401/timeout), el Code node siguiente genera un resumen sintético."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Resume la respuesta del LLM (choices[0].message.content) o genera fallback\nconst llmOut = $input.first().json?.choices?.[0]?.message?.content ?? $input.first().json?.message?.content;\nif (llmOut && llmOut.trim().length > 50) {\n  return [{ json: { summary: llmOut.trim() } }];\n}\nconst r = $('HTTP: reporte JSON').item.json.data;\nconst kpis = Object.fromEntries((r.businessKpis || []).map((k) => [k.name, k.value]));\nconst metrics = Object.fromEntries((r.modelMetrics || []).map((m) => [m.metric, m.value]));\nconst summary = [\n  `Reporte semanal ${r.window.start.slice(0,10)} → ${r.window.end.slice(0,10)}.`,\n  `Órdenes totales: ${r.ordersByStatus.reduce((a, b) => a + b.count, 0)}.`,\n  `Paradas evitadas: ${(kpis.downtime_avoided_h ?? 0).toFixed(0)}h.`,\n  `Ahorro estimado: €${(kpis.cost_savings_eur ?? 0).toLocaleString('es-ES')}.`,\n  `Precisión del modelo: ${((metrics.precision ?? 0) * 100).toFixed(1)}%.`,\n  `Disponibilidad: ${((kpis.availability ?? 0) * 100).toFixed(1)}%.`,\n].join(' ');\nreturn [{ json: { summary } }];"
+      },
+      "id": "code-03-fallback",
+      "name": "Resumen (fallback si LLM falla)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Genera sección de alertas destacadas\nconst r = $('HTTP: reporte JSON').item.json.data;\nconst metrics = Object.fromEntries((r.modelMetrics || []).map((m) => [m.metric, m.value]));\nconst alerts = [];\nif ((metrics.precision ?? 0) < 0.85) alerts.push(`⚠️ Precisión del modelo ${((metrics.precision ?? 0) * 100).toFixed(1)}% (objetivo 85%)`);\nif ((metrics.false_positives ?? 0) > 0.10) alerts.push(`⚠️ Falsos positivos ${((metrics.false_positives ?? 0) * 100).toFixed(1)}% (objetivo ≤ 10%)`);\nconst top = r.topPredictions?.[0];\nif (top && top.maxProb > 0.9) alerts.push(`🔴 Equipo ${top.name} con probabilidad máxima ${(top.maxProb * 100).toFixed(1)}%`);\n// Propaga el binario del PDF (viene del nodo FS anterior) para poder adjuntarlo al email.\nconst binary = $input.first().binary;\nreturn [binary ? { json: { alerts }, binary } : { json: { alerts } }];"
+      },
+      "id": "code-03-alerts",
+      "name": "Generar alertas destacadas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 380]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.SUPERVISOR_EMAIL}}",
+        "subject": "=📊 Reporte semanal MaintainPredict AI — {{ $('Calcular ventana semanal').item.json.label }}",
+        "emailFormat": "html",
+        "html": "=<div style=\"font-family:system-ui,sans-serif;max-width:720px\">\n<h1 style=\"color:#2563eb\">Reporte Semanal MaintainPredict AI</h1>\n<p><b>Periodo:</b> {{ $('HTTP: reporte JSON').item.json.data.window.start.slice(0,10) }} → {{ $('HTTP: reporte JSON').item.json.data.window.end.slice(0,10) }}</p>\n\n<h2>Resumen ejecutivo</h2>\n<p>{{ $('Resumen (fallback si LLM falla)').item.json.summary }}</p>\n\n<h2>Alertas destacadas</h2>\n<ul>\n{{ $('Generar alertas destacadas').item.json.alerts.map(a => `<li>${a}</li>`).join('') || '<li>Sin alertas</li>' }}\n</ul>\n\n<h2>KPIs de negocio</h2>\n<table style=\"border-collapse:collapse;width:100%\">\n  <tr><th style=\"border:1px solid #e2e8f0;padding:8px;background:#f8fafc\">KPI</th><th style=\"border:1px solid #e2e8f0;padding:8px;background:#f8fafc\">Valor</th></tr>\n  {{ $('HTTP: reporte JSON').item.json.data.businessKpis.map(k => `<tr><td style=\"border:1px solid #e2e8f0;padding:8px\">${k.name}</td><td style=\"border:1px solid #e2e8f0;padding:8px\">${k.value}</td></tr>`).join('') }}\n</table>\n\n<h2>Métricas del modelo</h2>\n<table style=\"border-collapse:collapse;width:100%\">\n  <tr><th style=\"border:1px solid #e2e8f0;padding:8px;background:#f8fafc\">Métrica</th><th style=\"border:1px solid #e2e8f0;padding:8px;background:#f8fafc\">Valor</th><th style=\"border:1px solid #e2e8f0;padding:8px;background:#f8fafc\">Objetivo</th></tr>\n  {{ $('HTTP: reporte JSON').item.json.data.modelMetrics.map(m => `<tr><td style=\"border:1px solid #e2e8f0;padding:8px\">${m.metric}</td><td style=\"border:1px solid #e2e8f0;padding:8px\">${m.value}</td><td style=\"border:1px solid #e2e8f0;padding:8px\">${m.metric === 'precision' ? '≥ 0.85' : m.metric === 'false_positives' ? '≤ 0.10' : '—'}</td></tr>`).join('') }}\n</table>\n\n<h2>Top 5 equipos en riesgo</h2>\n<table style=\"border-collapse:collapse;width:100%\">\n  <tr><th style=\"border:1px solid #e2e8f0;padding:8px;background:#f8fafc\">Equipo</th><th style=\"border:1px solid #e2e8f0;padding:8px;background:#f8fafc\">Criticidad</th><th style=\"border:1px solid #e2e8f0;padding:8px;background:#f8fafc\">Prob. máx</th></tr>\n  {{ $('HTTP: reporte JSON').item.json.data.topPredictions.slice(0,5).map(p => `<tr><td style=\"border:1px solid #e2e8f0;padding:8px\">${p.name}</td><td style=\"border:1px solid #e2e8f0;padding:8px\">${p.criticality}</td><td style=\"border:1px solid #e2e8f0;padding:8px\">${(p.maxProb*100).toFixed(1)}%</td></tr>`).join('') }}\n</table>\n\n<p style=\"margin-top:24px\"><a href=\"{{$env.APP_BASE_URL}}/observability\" style=\"background:#2563eb;color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px\">Ver observabilidad completa</a></p>\n<p style=\"color:#64748b;font-size:12px\">Adjuntos: reporte-semanal.pdf · reporte-semanal.xlsx</p>\n</div>",
+        "options": {
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              { "property": "data", "name": "reporte-semanal.pdf" }
+            ]
+          }
+        }
+      },
+      "id": "email-03",
+      "name": "Email: reporte al supervisor",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1300, 300],
+      "credentials": { "smtp": { "id": "mp_smtp", "name": "MaintainPredict SMTP" } },
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.SUPERVISOR_EMAIL}}",
+        "subject": "=❌ Error WF-03 reporte semanal",
+        "emailFormat": "html",
+        "html": "=<h2>Error generando reporte semanal</h2><p>Execution: {{$execution.id}}</p><p>{{$json.error?.message}}</p>",
+        "options": {}
+      },
+      "id": "email-03-error",
+      "name": "Email: alerta error WF-03",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [420, 620],
+      "credentials": { "smtp": { "id": "mp_smtp", "name": "MaintainPredict SMTP" } }
+    },
+    {
+      "parameters": {},
+      "id": "err-trigger-03",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [200, 620]
+    }
+  ],
+  "connections": {
+    "Schedule: lunes 08:00": {
+      "main": [[{ "node": "Calcular ventana semanal", "type": "main", "index": 0 }]]
+    },
+    "Manual Trigger: bajo demanda": {
+      "main": [[{ "node": "Calcular ventana semanal", "type": "main", "index": 0 }]]
+    },
+    "Calcular ventana semanal": {
+      "main": [[
+        { "node": "HTTP: reporte JSON", "type": "main", "index": 0 },
+        { "node": "HTTP: reporte XLSX", "type": "main", "index": 0 }
+      ]]
+    },
+    "HTTP: reporte PDF": {
+      "main": [[{ "node": "FS: guardar PDF", "type": "main", "index": 0 }]]
+    },
+    "HTTP: reporte XLSX": {
+      "main": [[{ "node": "FS: guardar XLSX", "type": "main", "index": 0 }]]
+    },
+    "HTTP: reporte JSON": {
+      "main": [[{ "node": "LLM: resumen ejecutivo", "type": "main", "index": 0 }]]
+    },
+    "LLM: resumen ejecutivo": {
+      "main": [[{ "node": "Resumen (fallback si LLM falla)", "type": "main", "index": 0 }]]
+    },
+    "Resumen (fallback si LLM falla)": {
+      "main": [[{ "node": "HTTP: reporte PDF", "type": "main", "index": 0 }]]
+    },
+    "FS: guardar PDF": {
+      "main": [[{ "node": "Generar alertas destacadas", "type": "main", "index": 0 }]]
+    },
+    "Generar alertas destacadas": {
+      "main": [[{ "node": "Email: reporte al supervisor", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Email: alerta error WF-03", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "wf-03" }],
+  "versionId": "2",
+  "active": false
+}

@@ -1,0 +1,38 @@
+# ───────── deps ─────────
+# Monorepo pnpm: hay que copiar el workspace + los manifiestos de cada paquete
+# antes de instalar, si no pnpm no resuelve las dependencias del workspace.
+FROM node:20-alpine AS deps
+WORKDIR /app
+RUN corepack enable
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml* ./
+COPY apps/web/package.json ./apps/web/
+COPY packages/shared-types/package.json ./packages/shared-types/
+RUN pnpm install --frozen-lockfile || pnpm install
+
+# ───────── build ─────────
+FROM node:20-alpine AS builder
+WORKDIR /app
+RUN corepack enable
+# En pnpm cada workspace tiene su propio node_modules (p. ej. apps/web/node_modules),
+# por eso copiamos el /app completo instalado en `deps`, no solo el node_modules raíz.
+COPY --from=deps /app ./
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN pnpm build
+
+# ───────── runtime ─────────
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
+RUN apk add --no-cache wget tini \
+    && addgroup -g 1001 -S nodejs \
+    && adduser -S nextjs -u 1001
+# El `output: standalone` de un monorepo conserva la estructura: el entrypoint es
+# apps/web/server.js (no la raíz), y public/.next/static cuelgan de apps/web/.
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/public ./apps/web/public
+COPY --from=builder --chown=nextjs:nodejs /app/apps/web/.next/static ./apps/web/.next/static
+USER nextjs
+EXPOSE 3000
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "apps/web/server.js"]

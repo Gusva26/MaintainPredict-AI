@@ -1,0 +1,199 @@
+networks:
+  mp_net:
+    driver: bridge
+
+volumes:
+  pg_data:
+  n8n_data:
+  reports_data:
+  web_node_modules:
+  web_app_node_modules:
+  web_next:
+  mock_scada_nm:
+  mock_erp_nm:
+  mock_sms_nm:
+  uploads_data:
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mp_postgres
+    restart: unless-stopped
+    # `pg_stat_statements` (Fase A.1) tiene que precargarse antes de crear la extensión.
+    command: postgres -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=all
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./infra/postgres/migrations:/migrations:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mp_net
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: dev
+    container_name: mp_web
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Dentro de la red de Compose, "localhost" apunta al propio contenedor.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      ML_SERVICE_URL: http://ml-service:8000
+      REPORTS_OUTPUT_DIR: /data/reports
+      UPLOAD_DIR: /data/uploads
+      # Direcciones de las integraciones DENTRO de la red de Compose. En `.env`
+      # pueden estar en versión localhost (para scripts del host); aquí se fijan
+      # a los nombres de servicio para que el ERP/SCADA/SMS/SMTP respondan de verdad.
+      ERP_BASE_URL: ${ERP_BASE_URL_INTERNAL:-http://mock-erp:9001}
+      SCADA_BASE_URL: ${SCADA_BASE_URL_INTERNAL:-http://mock-scada:9000}
+      SMS_BASE_URL: ${SMS_BASE_URL_INTERNAL:-http://mock-sms:9002}
+      SMTP_HOST: ${SMTP_HOST_INTERNAL:-mailhog}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    working_dir: /app/apps/web
+    command: pnpm dev
+    volumes:
+      - ./:/app
+      - web_node_modules:/app/node_modules
+      - web_app_node_modules:/app/apps/web/node_modules
+      - web_next:/app/apps/web/.next
+      - reports_data:/data/reports
+      - uploads_data:/data/uploads
+    networks:
+      - mp_net
+
+  ml-service:
+    build:
+      context: ./apps/ml-service
+      dockerfile: Dockerfile
+    container_name: mp_ml
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    networks:
+      - mp_net
+
+  # El volumen reports_data se crea root:root; n8n corre como usuario node (uid 1000)
+  # y WF-03 escribe ahí los PDF/XLSX. Este one-shot ajusta el dueño antes de arrancar n8n.
+  reports-init:
+    image: alpine:latest
+    container_name: mp_reports_init
+    restart: "no"
+    command: sh -c "mkdir -p /data/reports && chown -R 1000:1000 /data/reports"
+    volumes:
+      - reports_data:/data/reports
+    networks:
+      - mp_net
+
+  n8n:
+    image: n8nio/n8n:1.62.6
+    container_name: mp_n8n
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - WEBHOOK_URL=http://localhost:5678/
+      # ─── n8n internos (Fase 5.9) ─────────────────────
+      - APP_BASE_URL=${APP_BASE_URL:-http://web:3000}
+      - PUBLIC_APP_URL=${PUBLIC_APP_URL:-http://localhost:3000}
+      - INTERNAL_TOKEN=${INTERNAL_TOKEN:-change_me_internal_token_32_chars_long}
+      - SENSOR_API_KEY=${SENSOR_API_KEY:-sensor_key_change_me}
+      - ERP_BASE_URL=${ERP_BASE_URL:-http://mock-erp:9001}
+      - ERP_API_KEY=${ERP_API_KEY:-erp_key}
+      - SMTP_FROM=${SMTP_FROM:-maintainpredict@local}
+      - SUPERVISOR_EMAIL=${SUPERVISOR_EMAIL:-supervisor@mp.ai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_CHAT_MODEL=${OPENAI_CHAT_MODEL:-gpt-4o}
+      # ─── Telemetría/avisos de la propia instancia (entorno demo) ─────
+      # n8n 1.62.6 avisa en la UI de que hay versiones más nuevas; se silencia.
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - N8N_DIAGNOSTICS_ENABLED=false
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./infra/n8n/workflows:/workflows:ro
+      - reports_data:/data/reports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      reports-init:
+        condition: service_completed_successfully
+    networks:
+      - mp_net
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: mp_mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - mp_net
+
+  mock-scada:
+    image: node:20-alpine
+    container_name: mp_mock_scada
+    working_dir: /app
+    command: sh -c "npm i express && node server.js"
+    volumes:
+      - ./infra/mocks/scada:/app
+      - mock_scada_nm:/app/node_modules
+    ports:
+      - "9000:9000"
+    networks:
+      - mp_net
+
+  mock-erp:
+    image: node:20-alpine
+    container_name: mp_mock_erp
+    working_dir: /app
+    command: sh -c "npm i express && node server.js"
+    volumes:
+      - ./infra/mocks/erp:/app
+      - mock_erp_nm:/app/node_modules
+    ports:
+      - "9001:9001"
+    networks:
+      - mp_net
+
+  # Pasarela de SMS simulada. Solo se usa con SMS_PROVIDER=mock.
+  mock-sms:
+    image: node:20-alpine
+    container_name: mp_mock_sms
+    working_dir: /app
+    command: sh -c "npm i express && node server.js"
+    volumes:
+      - ./infra/mocks/sms:/app
+      - mock_sms_nm:/app/node_modules
+    ports:
+      - "9002:9002"
+    networks:
+      - mp_net
+

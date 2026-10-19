@@ -1,0 +1,185 @@
+{
+  "id": "6sAtitcvR5cxiwo2",
+  "name": "WF-04 Metrics Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 6 }]
+        }
+      },
+      "id": "cron-04",
+      "name": "Schedule: cada 6h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {},
+      "id": "manual-04",
+      "name": "Manual Trigger: bajo demanda",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [200, 480]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.APP_BASE_URL}}/api/observability/metrics/sync",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "content-type", "value": "application/json" },
+            { "name": "x-internal-token", "value": "={{$env.INTERNAL_TOKEN}}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ windowDays: 7, includeDirtyScan: true }) }}",
+        "options": { "timeout": 120000 }
+      },
+      "id": "http-04-sync",
+      "name": "HTTP: sync métricas + FP + datos sucios",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [420, 300],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.APP_BASE_URL}}/api/observability/dirty-data/scan",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "content-type", "value": "application/json" },
+            { "name": "x-internal-token", "value": "={{$env.INTERNAL_TOKEN}}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ windowHours: 24, zThreshold: 3 }) }}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "http-04-dirty",
+      "name": "HTTP: escaneo datos sucios dedicado",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 420],
+      "onError": "continueRegularOutput",
+      "notes": "Reporte detallado, no bloquea el flujo principal"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Analiza el estado y genera alertas\nconst sync = $('HTTP: sync métricas + FP + datos sucios').item.json.data;\n// El endpoint de sync ya incluye el escaneo de datos sucios (includeDirtyScan: true).\n// El nodo \"escaneo dedicado\" es una rama paralela solo-reporte, así que no se referencia aquí.\nconst dirty = sync.dirty ?? null;\n\nconst alerts = [];\nif ((sync.model?.precision ?? 1) < 0.85) alerts.push({ level: 'critical', msg: `Precisión ${(sync.model.precision*100).toFixed(1)}% < 85%` });\nif ((sync.falsePositives?.falsePositiveRate ?? 0) > 0.10) alerts.push({ level: 'warn', msg: `FP ${(sync.falsePositives.falsePositiveRate*100).toFixed(1)}% > 10%` });\nif ((sync.model?.recall ?? 1) < 0.75) alerts.push({ level: 'warn', msg: `Recall ${(sync.model.recall*100).toFixed(1)}% < 75%` });\nif ((dirty?.flaggedTotal ?? 0) > 100) alerts.push({ level: 'warn', msg: `${dirty.flaggedTotal} lecturas marcadas como suspect en 24h` });\n\n// Detección simple de drift: comparar precisión actual vs media histórica\nconst history = sync.latestMetrics?.find(m => m.metric === 'precision');\nif (history && sync.model?.precision && Math.abs(history.value - sync.model.precision) > 0.05) {\n  alerts.push({ level: 'warn', msg: `Posible drift: precisión varió ${((sync.model.precision - history.value)*100).toFixed(1)} puntos` });\n}\n\nreturn [{ json: { sync, dirty, alerts, hasAlerts: alerts.length > 0 } }];"
+      },
+      "id": "code-04-analyze",
+      "name": "Analizar y detectar drift",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.hasAlerts }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-04",
+      "name": "IF: hay alertas",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [860, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.SUPERVISOR_EMAIL}}",
+        "subject": "=⚠️ MaintainPredict: {{ $json.alerts.length }} alerta(s) de modelo",
+        "emailFormat": "html",
+        "html": "=<div style=\"font-family:system-ui,sans-serif;max-width:680px\">\n<h2 style=\"color:#dc2626\">Alertas de salud del modelo</h2>\n<ul>\n{{ $json.alerts.map(a => `<li><b>[${a.level.toUpperCase()}]</b> ${a.msg}</li>`).join('') }}\n</ul>\n<h3>Métricas actuales</h3>\n<table style=\"border-collapse:collapse;width:100%\">\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\">Precisión</td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{ ($json.sync.model.precision*100).toFixed(1) }}%</td></tr>\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\">Recall</td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{ ($json.sync.model.recall*100).toFixed(1) }}%</td></tr>\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\">F1</td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{ $json.sync.model.f1.toFixed(3) }}</td></tr>\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\">Falsos positivos</td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{ ($json.sync.falsePositives.falsePositiveRate*100).toFixed(1) }}%</td></tr>\n  <tr><td style=\"padding:6px;border:1px solid #e2e8f0\">Lecturas suspect (24h)</td><td style=\"padding:6px;border:1px solid #e2e8f0\">{{ $json.dirty?.flaggedTotal ?? 0 }}</td></tr>\n</table>\n<p><a href=\"{{ $env.PUBLIC_APP_URL || $env.APP_BASE_URL }}/observability\" style=\"background:#2563eb;color:#fff;padding:10px 20px;text-decoration:none;border-radius:6px\">Ver dashboard</a></p>\n</div>",
+        "options": {}
+      },
+      "id": "email-04",
+      "name": "Email: alerta métricas/drift",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1080, 220],
+      "credentials": { "smtp": { "id": "mp_smtp", "name": "MaintainPredict SMTP" } }
+    },
+    {
+      "parameters": {},
+      "id": "noop-04",
+      "name": "NoOp: sin alertas",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1080, 400]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{$env.SMTP_FROM}}",
+        "toEmail": "={{$env.SUPERVISOR_EMAIL}}",
+        "subject": "=❌ Error WF-04 (metrics sync)",
+        "emailFormat": "html",
+        "html": "=<h2>Error en sincronización de métricas</h2><p>Execution: {{$execution.id}}</p><p>{{$json.error?.message}}</p>",
+        "options": {}
+      },
+      "id": "email-04-error",
+      "name": "Email: alerta error WF-04",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [420, 620],
+      "credentials": { "smtp": { "id": "mp_smtp", "name": "MaintainPredict SMTP" } }
+    },
+    {
+      "parameters": {},
+      "id": "err-trigger-04",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [200, 620]
+    }
+  ],
+  "connections": {
+    "Schedule: cada 6h": {
+      "main": [[{ "node": "HTTP: sync métricas + FP + datos sucios", "type": "main", "index": 0 }]]
+    },
+    "Manual Trigger: bajo demanda": {
+      "main": [[{ "node": "HTTP: sync métricas + FP + datos sucios", "type": "main", "index": 0 }]]
+    },
+    "HTTP: sync métricas + FP + datos sucios": {
+      "main": [[
+        { "node": "Analizar y detectar drift", "type": "main", "index": 0 },
+        { "node": "HTTP: escaneo datos sucios dedicado", "type": "main", "index": 0 }
+      ]]
+    },
+    "Analizar y detectar drift": {
+      "main": [[{ "node": "IF: hay alertas", "type": "main", "index": 0 }]]
+    },
+    "IF: hay alertas": {
+      "main": [
+        [{ "node": "Email: alerta métricas/drift", "type": "main", "index": 0 }],
+        [{ "node": "NoOp: sin alertas", "type": "main", "index": 0 }]
+      ]
+    },
+    "Error Trigger": {
+      "main": [[{ "node": "Email: alerta error WF-04", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "wf-04" }],
+  "versionId": "2",
+  "active": false
+}

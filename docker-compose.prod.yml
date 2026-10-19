@@ -1,0 +1,191 @@
+networks:
+  mp_net:
+    driver: bridge
+
+volumes:
+  pg_data:
+  n8n_data:
+  reports_data:
+  uploads_data:
+  ml_models:
+  caddy_data:
+  caddy_config:
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mp_postgres
+    restart: unless-stopped
+    # `pg_stat_statements` (Fase A.1) tiene que precargarse antes de crear la extensión.
+    command: postgres -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=all
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./infra/postgres/migrations:/migrations:ro
+      - ./infra/postgres/backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mp_net
+
+  web:
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER}/maintainpredict-web:${TAG:-latest}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile.prod
+    container_name: mp_web
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "3000"
+    volumes:
+      - reports_data:/data/reports
+      - uploads_data:/data/uploads
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mp_net
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  ml-service:
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER}/maintainpredict-ml:${TAG:-latest}
+    build:
+      context: ./apps/ml-service
+      dockerfile: Dockerfile
+    container_name: mp_ml
+    restart: unless-stopped
+    env_file: .env
+    expose:
+      - "8000"
+    volumes:
+      - ml_models:/app/models
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/ml/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mp_net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+
+  # El volumen reports_data se crea root:root; n8n corre como usuario node (uid 1000)
+  # y WF-03 escribe ahí los PDF/XLSX. Este one-shot ajusta el dueño antes de arrancar n8n.
+  reports-init:
+    image: alpine:latest
+    container_name: mp_reports_init
+    restart: "no"
+    command: sh -c "mkdir -p /data/reports && chown -R 1000:1000 /data/reports"
+    volumes:
+      - reports_data:/data/reports
+    networks:
+      - mp_net
+
+  n8n:
+    image: n8nio/n8n:1.62.6
+    container_name: mp_n8n
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - N8N_HOST=${N8N_HOST_EXTERNAL}
+      - N8N_PROTOCOL=https
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - WEBHOOK_URL=https://${N8N_HOST_EXTERNAL}/
+      - APP_BASE_URL=${APP_BASE_URL}
+      - PUBLIC_APP_URL=${PUBLIC_APP_URL}
+      - INTERNAL_TOKEN=${INTERNAL_TOKEN}
+      - SENSOR_API_KEY=${SENSOR_API_KEY}
+      - ERP_BASE_URL=${ERP_BASE_URL}
+      - ERP_API_KEY=${ERP_API_KEY}
+      - SMTP_FROM=${SMTP_FROM}
+      - SUPERVISOR_EMAIL=${SUPERVISOR_EMAIL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_CHAT_MODEL=${OPENAI_CHAT_MODEL:-gpt-4o}
+      # Avisos de versión obsoleta y telemetría de la instancia
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - N8N_DIAGNOSTICS_ENABLED=false
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./infra/n8n/workflows:/workflows:ro
+      - reports_data:/data/reports
+    expose:
+      - "5678"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      reports-init:
+        condition: service_completed_successfully
+    networks:
+      - mp_net
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: mp_caddy
+    restart: unless-stopped
+    # Caddy sustituye {$APP_DOMAIN}/{$DOMAIN}/{$N8N_HOST_EXTERNAL} desde el entorno.
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - n8n
+    networks:
+      - mp_net
+
+  pg-backup:
+    image: prodrigestivill/postgres-backup-local:16
+    container_name: mp_pg_backup
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SCHEDULE: "@daily"
+      BACKUP_KEEP_DAYS: 7
+      BACKUP_KEEP_WEEKS: 4
+      BACKUP_KEEP_MONTHS: 6
+      HEALTHCHECK_PORT: 8080
+    volumes:
+      - ./infra/postgres/backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mp_net

@@ -1,0 +1,73 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  build-and-push:
+    name: Build & push images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag
+        id: tag
+        run: echo "value=${GITHUB_REF_NAME//\//-}" >> $GITHUB_OUTPUT
+
+      - name: Build & push web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile.prod
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/maintainpredict-web:${{ steps.tag.outputs.value }}
+            ghcr.io/${{ github.repository_owner }}/maintainpredict-web:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push ml
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/ml-service
+          file: apps/ml-service/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/maintainpredict-ml:${{ steps.tag.outputs.value }}
+            ghcr.io/${{ github.repository_owner }}/maintainpredict-ml:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ──────────────────────────────────────────────────────────────
+  # CD OPCIONAL — Descomentar y configurar los secretos:
+  #   DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY
+  # ──────────────────────────────────────────────────────────────
+  # deploy:
+  #   name: Deploy to VM
+  #   runs-on: ubuntu-latest
+  #   needs: build-and-push
+  #   environment: production
+  #   steps:
+  #     - name: SSH y pull
+  #       uses: appleboy/ssh-action@v1.0.3
+  #       with:
+  #         host: ${{ secrets.DEPLOY_HOST }}
+  #         username: ${{ secrets.DEPLOY_USER }}
+  #         key: ${{ secrets.DEPLOY_SSH_KEY }}
+  #         script: |
+  #           cd /opt/maintainpredict-ai
+  #           git pull
+  #           docker compose -f docker-compose.prod.yml pull
+  #           docker compose -f docker-compose.prod.yml up -d
+  #           docker image prune -f

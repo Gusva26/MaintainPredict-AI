@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Next.js
+.next/
+out/
+build/
+dist/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Python / ML
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+*.egg-info/
+.pytest_cache/
+models/*.joblib
+models/*.pkl
+data/raw/
+data/processed/
+data/datasets/
+
+# Docker volumes / runtime data
+data/reports/
+data/uploads/
+infra/postgres/backups/
+n8n_data/
+caddy_data/
+caddy_config/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.log
